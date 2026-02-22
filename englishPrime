@@ -1,0 +1,460 @@
+pip install gensim
+import re
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from sklearn.metrics.pairwise import cosine_similarity
+import time
+import warnings
+from gensim.models import Word2Vec, FastText
+from collections import Counter
+import gc
+
+random.seed(42)
+np.random.seed(42)
+warnings.filterwarnings('ignore')
+
+# Gematria for English: a=1, b=2, ..., z=26
+GEMATRIA_VALUES = {
+    'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5, 'f': 6, 'g': 7, 'h': 8, 'i': 9, 'j': 10,
+    'k': 11, 'l': 12, 'm': 13, 'n': 14, 'o': 15, 'p': 16, 'q': 17, 'r': 18, 's': 19,
+    't': 20, 'u': 21, 'v': 22, 'w': 23, 'x': 24, 'y': 25, 'z': 26
+}
+
+# רשימת הראשוניים המשותפים לשתי השפות
+SELECTED_PRIMES = [7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 53, 61, 67, 71, 73, 83]
+
+def load_text_file(filename):
+    """
+    Load text file and tokenize into words (lowercase, only letters)
+    """
+    print(f"  Reading: {filename}")
+    with open(filename, 'r', encoding='utf-8') as f:
+        text = f.read().lower()
+
+    # Extract only words (letters only)
+    words = re.findall(r'[a-z]+', text)
+    return words
+
+def calculate_gematria(word):
+    """Calculate English gematria value"""
+    return sum(GEMATRIA_VALUES.get(letter, 0) for letter in word.lower())
+
+def get_prime_factors(n):
+    factors = []
+    d = 2
+    while d * d <= n:
+        while (n % d) == 0:
+            factors.append(d)
+            n //= d
+        d += 1
+    if n > 1:
+        factors.append(n)
+    return factors
+
+def create_prime_factor_groups(words, selected_primes, min_group_size=3):
+    """
+    Create groups of words by prime factors - ONLY for selected primes
+    """
+    word_gematria = {}
+    prime_groups = {prime: set() for prime in selected_primes}
+
+    for word in words:
+        gematria_value = calculate_gematria(word)
+        if gematria_value > 0:
+            word_gematria[word] = gematria_value
+            prime_factors = get_prime_factors(gematria_value)
+
+            for prime in set(prime_factors):
+                if prime in prime_groups:
+                    prime_groups[prime].add(word)
+
+    # Filter groups that are too small
+    filtered_groups = {prime: word_set for prime, word_set in prime_groups.items()
+                      if len(word_set) >= min_group_size}
+
+    return dict(sorted(filtered_groups.items())), word_gematria
+
+def create_random_prime_factor_groups(prime_factor_groups, all_unique_words):
+    """
+    Create random groups maintaining same size as original groups
+    Sample without replacement from unique word pool
+    """
+    random_groups = {}
+    available_words = list(all_unique_words)
+    random.shuffle(available_words)
+
+    word_idx = 0
+    for i, (prime, original_group) in enumerate(prime_factor_groups.items()):
+        group_size = len(original_group)
+
+        if word_idx + group_size > len(available_words):
+            random.shuffle(available_words)
+            word_idx = 0
+
+        random_group = set(available_words[word_idx:word_idx + group_size])
+        word_idx += group_size
+
+        random_groups[f"Random_{i+1}"] = random_group
+
+    return random_groups
+
+def train_word2vec(words, vector_size=300, window=5):
+    print(f"🔵 Training Word2Vec on {len(words):,} words...")
+    start = time.time()
+
+    sentences = [words[i:i+10] for i in range(0, len(words), 10)]
+    model = Word2Vec(sentences, vector_size=vector_size, window=window,
+                    min_count=1, workers=4, epochs=20, sg=1)
+
+    print(f"✓ Completed in {time.time() - start:.1f} seconds")
+    return model
+
+def train_fasttext(words, vector_size=300, window=5):
+    print(f"🟠 Training FastText on {len(words):,} words...")
+    start = time.time()
+
+    sentences = [words[i:i+10] for i in range(0, len(words), 10)]
+    model = FastText(sentences, vector_size=vector_size, window=window,
+                    min_count=1, workers=4, epochs=20, sg=1)
+
+    print(f"✓ Completed in {time.time() - start:.1f} seconds")
+    return model
+
+def create_glove_vectors(words, vector_size=100):
+    """
+    Create simple GloVe-like vectors - for baseline
+    """
+    print(f"🟢 Creating GloVe vectors...")
+    word_counts = Counter(words)
+    vectors = {}
+
+    for word in set(words):
+        frequency_weight = word_counts[word] / max(word_counts.values())
+        length_weight = len(word) / 10.0
+        vector = np.random.randn(vector_size) * 0.1
+        vector[0] = frequency_weight
+        vector[1] = length_weight
+        vectors[word] = vector
+
+    return vectors
+
+def get_vectors_from_model(model, words):
+    """
+    Extract vectors from model
+    """
+    vectors = {}
+    for word in words:
+        if word in model.wv:
+            vectors[word] = model.wv[word]
+        else:
+            vectors[word] = np.random.randn(model.wv.vector_size) * 0.1
+    return vectors
+
+def calculate_average_distances(groups, vectors):
+    """
+    Calculate average distance between words in a group
+    Works with sets instead of dicts
+    """
+    results = {}
+    for group_id, words_set in groups.items():
+        words = list(words_set)
+        if len(words) <= 1:
+            results[group_id] = {"average_distance": 0, "num_words": len(words)}
+            continue
+
+        group_vectors = [vectors[word] for word in words if word in vectors]
+        if len(group_vectors) <= 1:
+            results[group_id] = {"average_distance": 0, "num_words": len(group_vectors)}
+            continue
+
+        try:
+            similarity_matrix = cosine_similarity(group_vectors)
+            distance_matrix = 1 - similarity_matrix
+            distances = [distance_matrix[i, j] for i in range(len(group_vectors))
+                        for j in range(i + 1, len(group_vectors))]
+            avg_distance = np.mean(distances) if distances else 0
+        except:
+            avg_distance = 0
+
+        results[group_id] = {"average_distance": avg_distance, "num_words": len(group_vectors)}
+        gc.collect()
+
+    return results
+
+def calculate_statistics_with_bonferroni(prime_results, random_results_list, num_tests):
+    """
+    Calculate statistics with Bonferroni correction for multiple tests
+    """
+    statistics = {}
+    bonferroni_alpha = 0.05 / num_tests
+
+    for prime_id in prime_results.keys():
+        observed = prime_results[prime_id]["average_distance"]
+
+        random_dists = []
+        for random_results in random_results_list:
+            matching_keys = [k for k in random_results.keys() if k.startswith("Random_")]
+            prime_index = list(prime_results.keys()).index(prime_id)
+            if prime_index < len(matching_keys):
+                random_key = matching_keys[prime_index]
+                random_dists.append(random_results[random_key]["average_distance"])
+
+        if len(random_dists) > 0:
+            baseline_mean = np.mean(random_dists)
+            baseline_std = np.std(random_dists)
+
+            z_score = (observed - baseline_mean) / baseline_std if baseline_std > 0 else 0
+            t_stat, p_value = stats.ttest_1samp(random_dists, observed)
+
+            percentile = stats.percentileofscore(random_dists, observed)
+
+            statistics[prime_id] = {
+                'observed': observed,
+                'baseline_mean': baseline_mean,
+                'baseline_std': baseline_std,
+                'z_score': z_score,
+                'p_value': p_value,
+                'p_value_bonferroni': p_value * num_tests,
+                'significant_bonferroni': (p_value * num_tests) < 0.05,
+                'percentile': percentile,
+                'num_words': prime_results[prime_id]["num_words"],
+                'num_random_samples': len(random_dists)
+            }
+
+    return statistics
+
+def print_detailed_statistics(w2v_stats, ft_stats, gl_stats, model_names):
+    """
+    Print detailed statistics
+    """
+    print("\n" + "="*100)
+    print("Detailed Statistics by Model")
+    print("="*100)
+
+    for stats_dict, name in zip([w2v_stats, ft_stats, gl_stats], model_names):
+        print(f"\n{'='*50}")
+        print(f"{name}")
+        print(f"{'='*50}")
+
+        sorted_primes = sorted(stats_dict.items(), key=lambda x: x[1]['z_score'])
+
+        print(f"\n{'Prime':<10} {'Z-Score':<10} {'p-value':<12} {'p(Bonf)':<12} {'Sig?':<10} {'Words':<8}")
+        print("-" * 70)
+
+        for prime, stat in sorted_primes:
+            sig_marker = "✓✓" if stat['significant_bonferroni'] else ("✓" if stat['p_value'] < 0.05 else "")
+            print(f"{prime:<10} {stat['z_score']:>9.2f} {stat['p_value']:>11.4f} "
+                  f"{stat['p_value_bonferroni']:>11.4f} {sig_marker:<10} {stat['num_words']:<8}")
+
+        sig_regular = sum(1 for s in stats_dict.values() if s['p_value'] < 0.05)
+        sig_bonf = sum(1 for s in stats_dict.values() if s['significant_bonferroni'])
+        clustering = sum(1 for s in stats_dict.values() if s['p_value'] < 0.05 and s['z_score'] < 0)
+
+        print(f"\nSummary for {name}:")
+        print(f"  Significant (p<0.05): {sig_regular}/{len(stats_dict)}")
+        print(f"  Significant (Bonferroni): {sig_bonf}/{len(stats_dict)}")
+        print(f"  Clustering (z<0, p<0.05): {clustering}/{len(stats_dict)}")
+
+def create_enhanced_bar_chart(word2vec_stats, fasttext_stats, glove_stats, output_file=None):
+    """
+    Enhanced bar chart with Bonferroni correction marking
+    """
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+
+    primes = sorted(word2vec_stats.keys())
+    x = np.arange(len(primes))
+
+    word2vec_z = [word2vec_stats[p]['z_score'] for p in primes]
+    fasttext_z = [fasttext_stats[p]['z_score'] for p in primes]
+    glove_z = [glove_stats[p]['z_score'] for p in primes]
+
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(20, 10))
+
+    w2v_colors = []
+    ft_colors = []
+    gl_colors = []
+
+    for p in primes:
+        if word2vec_stats[p]['significant_bonferroni']:
+            w2v_colors.append('#003f7f')
+        elif word2vec_stats[p]['p_value'] < 0.05:
+            w2v_colors.append('#1f77b4')
+        else:
+            w2v_colors.append('#A9C5D9')
+
+        if fasttext_stats[p]['significant_bonferroni']:
+            ft_colors.append('#cc5500')
+        elif fasttext_stats[p]['p_value'] < 0.05:
+            ft_colors.append('#ff7f0e')
+        else:
+            ft_colors.append('#FFCC99')
+
+        if glove_stats[p]['significant_bonferroni']:
+            gl_colors.append('#1a5f1a')
+        elif glove_stats[p]['p_value'] < 0.05:
+            gl_colors.append('#2ca02c')
+        else:
+            gl_colors.append('#A8DBA8')
+
+    ax.bar(x - width, word2vec_z, width, color=w2v_colors, edgecolor='black', linewidth=0.8, label='Word2Vec')
+    ax.bar(x, fasttext_z, width, color=ft_colors, edgecolor='black', linewidth=0.8, hatch='///', label='FastText')
+    ax.bar(x + width, glove_z, width, color=gl_colors, edgecolor='black', linewidth=0.8, hatch='...', label='GloVe')
+
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=1.5)
+    ax.set_xlabel('Prime Number', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Z-Score (Negative = Clustering)', fontsize=16, fontweight='bold')
+    ax.set_title('ALice Analysis - Selected Primes Only\n(Darkest = Bonferroni-corrected p<0.05, Medium = p<0.05, Light = n.s.)',
+                 fontsize=18, fontweight='bold', pad=20)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(p) for p in primes], rotation=45, ha='right', fontsize=12)
+    ax.legend(loc='upper right', fontsize=13)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+
+    plt.tight_layout()
+    if output_file:
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"✓ Z-scores chart saved: {output_file}")
+    plt.show()
+
+def create_effect_size_chart(word2vec_stats, fasttext_stats, glove_stats, output_file=None):
+    """
+    Effect size chart: (observed - baseline) / baseline
+    Shows percentage difference from random baseline
+    """
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+
+    primes = sorted(word2vec_stats.keys())
+    x = np.arange(len(primes))
+
+    w2v_effect = [(word2vec_stats[p]['observed'] - word2vec_stats[p]['baseline_mean']) /
+                  word2vec_stats[p]['baseline_mean'] * 100 for p in primes]
+    ft_effect = [(fasttext_stats[p]['observed'] - fasttext_stats[p]['baseline_mean']) /
+                 fasttext_stats[p]['baseline_mean'] * 100 for p in primes]
+    gl_effect = [(glove_stats[p]['observed'] - glove_stats[p]['baseline_mean']) /
+                 glove_stats[p]['baseline_mean'] * 100 for p in primes]
+
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(20, 10))
+
+    w2v_colors = ['#003f7f' if word2vec_stats[p]['significant_bonferroni'] else
+                  ('#1f77b4' if word2vec_stats[p]['p_value'] < 0.05 else '#A9C5D9') for p in primes]
+    ft_colors = ['#cc5500' if fasttext_stats[p]['significant_bonferroni'] else
+                 ('#ff7f0e' if fasttext_stats[p]['p_value'] < 0.05 else '#FFCC99') for p in primes]
+    gl_colors = ['#1a5f1a' if glove_stats[p]['significant_bonferroni'] else
+                 ('#2ca02c' if glove_stats[p]['p_value'] < 0.05 else '#A8DBA8') for p in primes]
+
+    ax.bar(x - width, w2v_effect, width, color=w2v_colors, edgecolor='black', linewidth=0.8, label='Word2Vec')
+    ax.bar(x, ft_effect, width, color=ft_colors, edgecolor='black', linewidth=0.8, hatch='///', label='FastText')
+    ax.bar(x + width, gl_effect, width, color=gl_colors, edgecolor='black', linewidth=0.8, hatch='...', label='GloVe')
+
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=1.5)
+    ax.set_xlabel('Prime Number', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Effect Size (%)', fontsize=16, fontweight='bold')
+    ax.set_title('Effect Size: % Change from Random Baseline\n(Negative = Tighter Clustering)',
+                 fontsize=18, fontweight='bold', pad=20)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(p) for p in primes], rotation=45, ha='right', fontsize=12)
+    ax.legend(loc='upper right', fontsize=13)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+
+    plt.tight_layout()
+    if output_file:
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"✓ Effect Size chart saved: {output_file}")
+    plt.show()
+
+# ========== MAIN EXECUTION ==========
+
+print("="*80)
+print("English Gematria Analysis - " + "Alice in Wonderland (Selected Primes)")
+print("="*80)
+print(f"Selected primes: {SELECTED_PRIMES}")
+
+# Paths - adjust as needed!
+training_files = [
+    # r"/content/drive/My Drive/DATA/TheTurnOfTheScrew42000.txt",
+    r"/content/drive/My Drive/DATA/Frankenstein78000words.txt",
+    r"/content/drive/My Drive/DATA/alice.txt"
+    # r"/content/drive/My Drive/DATA/revelation.txt"
+]
+test_file =  r"/content/drive/My Drive/DATA/alice.txt" # r"/content/drive/My Drive/DATA/revelation.txt" 
+
+print("\n📖 Loading training data...")
+all_training_words = []
+for filepath in training_files:
+    words = load_text_file(filepath)
+    all_training_words.extend(words)
+    print(f"  Added {len(words):,} words")
+
+print(f"\n✓ Total training corpus: {len(all_training_words):,} words")
+
+print("\n📖 Loading test data (Alice)...")
+alice_words = load_text_file(test_file)
+print(f"✓ Alice: {len(alice_words):,} words")
+
+print("\n🎓 Training models on full corpus...")
+w2v_model = train_word2vec(all_training_words)
+ft_model = train_fasttext(all_training_words)
+
+print("\n📊 Creating groups from Alice (selected primes only)...")
+prime_groups, _ = create_prime_factor_groups(alice_words, SELECTED_PRIMES, min_group_size=3)
+print(f"✓ {len(prime_groups)} groups created (out of {len(SELECTED_PRIMES)} selected primes)")
+
+print("\nGroup sizes:")
+for prime, words in sorted(prime_groups.items()):
+    print(f"  {prime}: {len(words)} words")
+
+# רשימת ראשוניים שלא עברו את הסף
+missing_primes = [p for p in SELECTED_PRIMES if p not in prime_groups]
+if missing_primes:
+    print(f"\n⚠ Primes with <3 words (excluded): {missing_primes}")
+
+print("\n🔢 Extracting vectors...")
+alice_unique_words = list(set(alice_words))
+print(f"✓ {len(alice_unique_words):,} unique words")
+
+w2v_vecs = get_vectors_from_model(w2v_model, alice_unique_words)
+ft_vecs = get_vectors_from_model(ft_model, alice_unique_words)
+gl_vecs = create_glove_vectors(alice_words)
+
+print("\n📏 Calculating distances in prime groups...")
+prime_w2v = calculate_average_distances(prime_groups, w2v_vecs)
+prime_ft = calculate_average_distances(prime_groups, ft_vecs)
+prime_gl = calculate_average_distances(prime_groups, gl_vecs)
+
+print("\n🎲 500 random runs (for robust statistics)...")
+num_random_runs = 500
+rand_w2v_all, rand_ft_all, rand_gl_all = [], [], []
+
+for run in range(num_random_runs):
+    if (run + 1) % 100 == 0:
+        print(f"  {run + 1}/{num_random_runs}")
+
+    rand_groups = create_random_prime_factor_groups(prime_groups, alice_unique_words)
+    rand_w2v_all.append(calculate_average_distances(rand_groups, w2v_vecs))
+    rand_ft_all.append(calculate_average_distances(rand_groups, ft_vecs))
+    rand_gl_all.append(calculate_average_distances(rand_groups, gl_vecs))
+
+print("\n📈 Calculating statistics with Bonferroni correction...")
+num_tests = len(prime_groups) * 3
+print(f"Number of tests: {num_tests}")
+print(f"Bonferroni threshold: p < {0.05/num_tests:.6f}")
+
+w2v_stats = calculate_statistics_with_bonferroni(prime_w2v, rand_w2v_all, num_tests)
+ft_stats = calculate_statistics_with_bonferroni(prime_ft, rand_ft_all, num_tests)
+gl_stats = calculate_statistics_with_bonferroni(prime_gl, rand_gl_all, num_tests)
+
+print_detailed_statistics(w2v_stats, ft_stats, gl_stats, ["Word2Vec", "FastText", "GloVe"])
+
+print("\n📊 Creating visualizations...")
+timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+create_enhanced_bar_chart(w2v_stats, ft_stats, gl_stats, f'english_selected_primes_zscores_{timestamp}.png')
+create_effect_size_chart(w2v_stats, ft_stats, gl_stats, f'english_selected_primes_effect_{timestamp}.png')
+
+print("\n" + "="*80)
+print("✓ Analysis completed successfully!")
+print("="*80)
