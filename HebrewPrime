@@ -1,0 +1,450 @@
+pip install gensim
+import re
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from sklearn.metrics.pairwise import cosine_similarity
+import time
+import warnings
+from gensim.models import Word2Vec, FastText
+from collections import Counter
+import gc
+
+random.seed(42)
+np.random.seed(42)
+warnings.filterwarnings('ignore')
+
+GEMATRIA_VALUES = {
+    'א': 1, 'ב': 2, 'ג': 3, 'ד': 4, 'ה': 5, 'ו': 6, 'ז': 7, 'ח': 8, 'ט': 9, 'י': 10,
+    'כ': 20, 'ל': 30, 'מ': 40, 'נ': 50, 'ס': 60, 'ע': 70, 'פ': 80, 'צ': 90, 'ק': 100,
+    'ר': 200, 'ש': 300, 'ת': 400, 'ך': 20, 'ם': 40, 'ן': 50, 'ף': 80, 'ץ': 90
+}
+
+def load_lemmas_file(filename):
+    print(f"  קורא: {filename}")
+    with open(filename, 'r', encoding='utf-8') as f:
+        lemmas = [line.strip() for line in f if line.strip()]
+    return lemmas
+
+def calculate_gematria(word):
+    return sum(GEMATRIA_VALUES.get(letter, 0) for letter in word)
+
+def get_prime_factors(n):
+    factors = []
+    d = 2
+    while d * d <= n:
+        while (n % d) == 0:
+            factors.append(d)
+            n //= d
+        d += 1
+    if n > 1:
+        factors.append(n)
+    return factors
+
+def create_prime_factor_groups(words, min_group_size=3, min_prime=7, max_prime=89):
+    """
+    יוצר קבוצות של מילים לפי גורמים ראשוניים בגימטריה
+    שים לב: מילה יכולה להופיע **פעם אחת בלבד** בכל קבוצה
+    """
+    word_gematria = {}
+    prime_groups = {}
+
+    for word in words:
+        gematria_value = calculate_gematria(word)
+        if gematria_value > 0:
+            word_gematria[word] = gematria_value
+            prime_factors = get_prime_factors(gematria_value)
+
+            for prime in set(prime_factors):  # set = כל גורם ראשוני פעם אחת
+                if min_prime <= prime <= max_prime:
+                    if prime not in prime_groups:
+                        prime_groups[prime] = set()  # שינוי: set במקום dict
+                    prime_groups[prime].add(word)
+
+    # סינון קבוצות קטנות מדי
+    filtered_groups = {prime: word_set for prime, word_set in prime_groups.items()
+                      if len(word_set) >= min_group_size}
+
+    return dict(sorted(filtered_groups.items())), word_gematria
+
+def create_random_prime_factor_groups(prime_factor_groups, all_unique_words):
+    """
+    יוצר קבוצות אקראיות תוך שמירה על גודל זהה לקבוצות הראשוניות
+    תיקון מרכזי: דגימה ללא החזרה מתוך מאגר המילים הייחודיות
+    """
+    random_groups = {}
+    available_words = list(all_unique_words)
+    random.shuffle(available_words)
+
+    word_idx = 0
+    for i, (prime, original_group) in enumerate(prime_factor_groups.items()):
+        group_size = len(original_group)
+
+        if word_idx + group_size > len(available_words):
+            # אם נגמרו המילים, ערבב מחדש
+            random.shuffle(available_words)
+            word_idx = 0
+
+        random_group = set(available_words[word_idx:word_idx + group_size])
+        word_idx += group_size
+
+        random_groups[f"Random_{i+1}"] = random_group
+
+    return random_groups
+
+def train_word2vec(lemmas, vector_size=300, window=5):
+    print(f"🔵 אימון Word2Vec על {len(lemmas):,} למות...")
+    start = time.time()
+
+    sentences = [lemmas[i:i+10] for i in range(0, len(lemmas), 10)]
+    model = Word2Vec(sentences, vector_size=vector_size, window=window,
+                    min_count=1, workers=4, epochs=20, sg=1)
+
+    print(f"✓ הושלם תוך {time.time() - start:.1f} שניות")
+    return model
+
+def train_fasttext(lemmas, vector_size=300, window=5):
+    print(f"🟠 אימון FastText על {len(lemmas):,} למות...")
+    start = time.time()
+
+    sentences = [lemmas[i:i+10] for i in range(0, len(lemmas), 10)]
+    model = FastText(sentences, vector_size=vector_size, window=window,
+                    min_count=1, workers=4, epochs=20, sg=1)
+
+    print(f"✓ הושלם תוך {time.time() - start:.1f} שניות")
+    return model
+
+def create_glove_vectors(words, vector_size=100):
+    """
+    יוצר GloVe vectors פשטניים - לשימוש כקו בסיס
+    """
+    print(f"🟢 יצירת GloVe vectors...")
+    word_counts = Counter(words)
+    vectors = {}
+
+    for word in set(words):
+        frequency_weight = word_counts[word] / max(word_counts.values())
+        length_weight = len(word) / 10.0
+        vector = np.random.randn(vector_size) * 0.1
+        vector[0] = frequency_weight
+        vector[1] = length_weight
+        vectors[word] = vector
+
+    return vectors
+
+def get_vectors_from_model(model, words):
+    """
+    מחלץ וקטורים מהמודל
+    """
+    vectors = {}
+    for word in words:
+        if word in model.wv:
+            vectors[word] = model.wv[word]
+        else:
+            vectors[word] = np.random.randn(model.wv.vector_size) * 0.1
+    return vectors
+
+def calculate_average_distances(groups, vectors):
+    """
+    מחשב מרחק ממוצע בין מילים בקבוצה
+    שינוי: עובד עם set במקום dict
+    """
+    results = {}
+    for group_id, words_set in groups.items():
+        words = list(words_set)
+        if len(words) <= 1:
+            results[group_id] = {"average_distance": 0, "num_words": len(words)}
+            continue
+
+        group_vectors = [vectors[word] for word in words if word in vectors]
+        if len(group_vectors) <= 1:
+            results[group_id] = {"average_distance": 0, "num_words": len(group_vectors)}
+            continue
+
+        try:
+            similarity_matrix = cosine_similarity(group_vectors)
+            distance_matrix = 1 - similarity_matrix
+            distances = [distance_matrix[i, j] for i in range(len(group_vectors))
+                        for j in range(i + 1, len(group_vectors))]
+            avg_distance = np.mean(distances) if distances else 0
+        except:
+            avg_distance = 0
+
+        results[group_id] = {"average_distance": avg_distance, "num_words": len(group_vectors)}
+        gc.collect()
+
+    return results
+
+def calculate_statistics_with_bonferroni(prime_results, random_results_list, num_tests):
+    """
+    מחשב סטטיסטיקה עם תיקון Bonferroni למספר בדיקות
+    """
+    statistics = {}
+    bonferroni_alpha = 0.05 / num_tests
+
+    for prime_id in prime_results.keys():
+        observed = prime_results[prime_id]["average_distance"]
+
+        random_dists = []
+        for random_results in random_results_list:
+            matching_keys = [k for k in random_results.keys() if k.startswith("Random_")]
+            prime_index = list(prime_results.keys()).index(prime_id)
+            if prime_index < len(matching_keys):
+                random_key = matching_keys[prime_index]
+                random_dists.append(random_results[random_key]["average_distance"])
+
+        if len(random_dists) > 0:
+            baseline_mean = np.mean(random_dists)
+            baseline_std = np.std(random_dists)
+
+            z_score = (observed - baseline_mean) / baseline_std if baseline_std > 0 else 0
+            t_stat, p_value = stats.ttest_1samp(random_dists, observed)
+
+            # חישוב percentile - איפה הערך הנצפה נמצא בהתפלגות
+            percentile = stats.percentileofscore(random_dists, observed)
+
+            statistics[prime_id] = {
+                'observed': observed,
+                'baseline_mean': baseline_mean,
+                'baseline_std': baseline_std,
+                'z_score': z_score,
+                'p_value': p_value,
+                'p_value_bonferroni': p_value * num_tests,  # תיקון Bonferroni
+                'significant_bonferroni': (p_value * num_tests) < 0.05,
+                'percentile': percentile,
+                'num_words': prime_results[prime_id]["num_words"],
+                'num_random_samples': len(random_dists)
+            }
+
+    return statistics
+
+def print_detailed_statistics(w2v_stats, ft_stats, gl_stats, model_names):
+    """
+    מדפיס סטטיסטיקה מפורטת
+    """
+    print("\n" + "="*100)
+    print("סטטיסטיקה מפורטת לפי מודל")
+    print("="*100)
+
+    for stats_dict, name in zip([w2v_stats, ft_stats, gl_stats], model_names):
+        print(f"\n{'='*50}")
+        print(f"{name}")
+        print(f"{'='*50}")
+
+        # מיון לפי z-score (מהנמוך ביותר = clustering החזק ביותר)
+        sorted_primes = sorted(stats_dict.items(), key=lambda x: x[1]['z_score'])
+
+        print(f"\n{'ראשוני':<10} {'Z-Score':<10} {'p-value':<12} {'p(Bonf)':<12} {'מובהק?':<10} {'מילים':<8}")
+        print("-" * 70)
+
+        for prime, stat in sorted_primes:
+            sig_marker = "✓✓" if stat['significant_bonferroni'] else ("✓" if stat['p_value'] < 0.05 else "")
+            print(f"{prime:<10} {stat['z_score']:>9.2f} {stat['p_value']:>11.4f} "
+                  f"{stat['p_value_bonferroni']:>11.4f} {sig_marker:<10} {stat['num_words']:<8}")
+
+        # סיכום
+        sig_regular = sum(1 for s in stats_dict.values() if s['p_value'] < 0.05)
+        sig_bonf = sum(1 for s in stats_dict.values() if s['significant_bonferroni'])
+        clustering = sum(1 for s in stats_dict.values() if s['p_value'] < 0.05 and s['z_score'] < 0)
+
+        print(f"\nסיכום {name}:")
+        print(f"  מובהק (p<0.05): {sig_regular}/{len(stats_dict)}")
+        print(f"  מובהק (Bonferroni): {sig_bonf}/{len(stats_dict)}")
+        print(f"  Clustering (z<0, p<0.05): {clustering}/{len(stats_dict)}")
+
+def create_enhanced_bar_chart(word2vec_stats, fasttext_stats, glove_stats, output_file=None):
+    """
+    גרף עמודות משופר עם סימון תיקון Bonferroni
+    """
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+
+    primes = sorted(word2vec_stats.keys())
+    x = np.arange(len(primes))
+
+    word2vec_z = [word2vec_stats[p]['z_score'] for p in primes]
+    fasttext_z = [fasttext_stats[p]['z_score'] for p in primes]
+    glove_z = [glove_stats[p]['z_score'] for p in primes]
+
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(20, 10))
+
+    # צבעים - עכשיו עם 3 רמות: לא מובהק, מובהק רגיל, מובהק Bonferroni
+    w2v_colors = []
+    ft_colors = []
+    gl_colors = []
+
+    for p in primes:
+        # Word2Vec
+        if word2vec_stats[p]['significant_bonferroni']:
+            w2v_colors.append('#003f7f')  # כחול מאוד כהה
+        elif word2vec_stats[p]['p_value'] < 0.05:
+            w2v_colors.append('#1f77b4')  # כחול בינוני
+        else:
+            w2v_colors.append('#A9C5D9')  # כחול בהיר
+
+        # FastText
+        if fasttext_stats[p]['significant_bonferroni']:
+            ft_colors.append('#cc5500')  # כתום כהה
+        elif fasttext_stats[p]['p_value'] < 0.05:
+            ft_colors.append('#ff7f0e')  # כתום בינוני
+        else:
+            ft_colors.append('#FFCC99')  # כתום בהיר
+
+        # GloVe
+        if glove_stats[p]['significant_bonferroni']:
+            gl_colors.append('#1a5f1a')  # ירוק כהה
+        elif glove_stats[p]['p_value'] < 0.05:
+            gl_colors.append('#2ca02c')  # ירוק בינוני
+        else:
+            gl_colors.append('#A8DBA8')  # ירוק בהיר
+
+    ax.bar(x - width, word2vec_z, width, color=w2v_colors, edgecolor='black', linewidth=0.8, label='Word2Vec')
+    ax.bar(x, fasttext_z, width, color=ft_colors, edgecolor='black', linewidth=0.8, hatch='///', label='FastText')
+    ax.bar(x + width, glove_z, width, color=gl_colors, edgecolor='black', linewidth=0.8, hatch='...', label='GloVe')
+
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=1.5)
+    ax.set_xlabel('Prime Number', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Z-Score (Negative = Clustering)', fontsize=16, fontweight='bold')
+    ax.set_title('Bereshit Analysis - Trained on Full Torah\n(Darkest = Bonferroni-corrected p<0.05, Medium = p<0.05, Light = n.s.)',
+                 fontsize=18, fontweight='bold', pad=20)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(p) for p in primes], rotation=45, ha='right', fontsize=12)
+    ax.legend(loc='upper right', fontsize=13)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+
+    plt.tight_layout()
+    if output_file:
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"✓ גרף Z-scores: {output_file}")
+    plt.show()
+
+def create_effect_size_chart(word2vec_stats, fasttext_stats, glove_stats, output_file=None):
+    """
+    גרף חדש: גודל אפקט (observed - baseline) / baseline
+    מראה באחוזים כמה הקבוצה הראשונית צפופה/מפוזרת יותר מהאקראית
+    """
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+
+    primes = sorted(word2vec_stats.keys())
+    x = np.arange(len(primes))
+
+    # חישוב effect size באחוזים
+    w2v_effect = [(word2vec_stats[p]['observed'] - word2vec_stats[p]['baseline_mean']) /
+                  word2vec_stats[p]['baseline_mean'] * 100 for p in primes]
+    ft_effect = [(fasttext_stats[p]['observed'] - fasttext_stats[p]['baseline_mean']) /
+                 fasttext_stats[p]['baseline_mean'] * 100 for p in primes]
+    gl_effect = [(glove_stats[p]['observed'] - glove_stats[p]['baseline_mean']) /
+                 glove_stats[p]['baseline_mean'] * 100 for p in primes]
+
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(20, 10))
+
+    # צבעים לפי מובהקות
+    w2v_colors = ['#003f7f' if word2vec_stats[p]['significant_bonferroni'] else
+                  ('#1f77b4' if word2vec_stats[p]['p_value'] < 0.05 else '#A9C5D9') for p in primes]
+    ft_colors = ['#cc5500' if fasttext_stats[p]['significant_bonferroni'] else
+                 ('#ff7f0e' if fasttext_stats[p]['p_value'] < 0.05 else '#FFCC99') for p in primes]
+    gl_colors = ['#1a5f1a' if glove_stats[p]['significant_bonferroni'] else
+                 ('#2ca02c' if glove_stats[p]['p_value'] < 0.05 else '#A8DBA8') for p in primes]
+
+    ax.bar(x - width, w2v_effect, width, color=w2v_colors, edgecolor='black', linewidth=0.8, label='Word2Vec')
+    ax.bar(x, ft_effect, width, color=ft_colors, edgecolor='black', linewidth=0.8, hatch='///', label='FastText')
+    ax.bar(x + width, gl_effect, width, color=gl_colors, edgecolor='black', linewidth=0.8, hatch='...', label='GloVe')
+
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=1.5)
+    ax.set_xlabel('Prime Number', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Effect Size (%)', fontsize=16, fontweight='bold')
+    ax.set_title('Effect Size: % Change from Random Baseline\n(Negative = Tighter Clustering)',
+                 fontsize=18, fontweight='bold', pad=20)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(p) for p in primes], rotation=45, ha='right', fontsize=12)
+    ax.legend(loc='upper right', fontsize=13)
+    ax.grid(True, alpha=0.3, axis='y', linestyle='--')
+
+    plt.tight_layout()
+    if output_file:
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"✓ גרף Effect Size: {output_file}")
+    plt.show()
+
+# ========== הרצה ==========
+
+print("="*80)
+print("ניתוח בראשית משופר - אימון על התורה המלאה")
+print("="*80)
+
+# נתיבים - שנה לפי הצורך!
+torah_path = r"/content/drive/My Drive/DATA/torah_lemmatized.txt"
+bereshit_path = r"/content/drive/My Drive/DATA/TextBereshitCompleteLemmas.txt"
+
+print("\n📖 טעינת נתונים...")
+torah_lemmas = load_lemmas_file(torah_path)
+bereshit_lemmas = load_lemmas_file(bereshit_path)
+
+print(f"✓ תורה: {len(torah_lemmas):,} למות")
+print(f"✓ בראשית: {len(bereshit_lemmas):,} למות")
+
+print("\n🎓 אימון מודלים על התורה...")
+w2v_model = train_word2vec(torah_lemmas)
+ft_model = train_fasttext(torah_lemmas)
+
+print("\n📊 יצירת קבוצות מבראשית...")
+prime_groups, _ = create_prime_factor_groups(bereshit_lemmas, min_group_size=3, min_prime=7, max_prime=89)
+print(f"✓ {len(prime_groups)} קבוצות")
+
+# הדפסת גדלי קבוצות
+print("\nגדלי קבוצות:")
+for prime, words in sorted(prime_groups.items()):
+    print(f"  {prime}: {len(words)} מילים")
+
+print("\n🔢 חילוץ וקטורים...")
+bereshit_unique_words = list(set(bereshit_lemmas))
+print(f"✓ {len(bereshit_unique_words):,} מילים ייחודיות")
+
+w2v_vecs = get_vectors_from_model(w2v_model, bereshit_unique_words)
+ft_vecs = get_vectors_from_model(ft_model, bereshit_unique_words)
+gl_vecs = create_glove_vectors(bereshit_lemmas)
+
+print("\n📏 חישוב מרחקים בקבוצות ראשוניות...")
+prime_w2v = calculate_average_distances(prime_groups, w2v_vecs)
+prime_ft = calculate_average_distances(prime_groups, ft_vecs)
+prime_gl = calculate_average_distances(prime_groups, gl_vecs)
+
+print("\n🎲 500 ריצות אקראיות (לסטטיסטיקה חזקה יותר)...")
+num_random_runs = 500
+rand_w2v_all, rand_ft_all, rand_gl_all = [], [], []
+
+for run in range(num_random_runs):
+    if (run + 1) % 100 == 0:
+        print(f"  {run + 1}/{num_random_runs}")
+
+    rand_groups = create_random_prime_factor_groups(prime_groups, bereshit_unique_words)
+    rand_w2v_all.append(calculate_average_distances(rand_groups, w2v_vecs))
+    rand_ft_all.append(calculate_average_distances(rand_groups, ft_vecs))
+    rand_gl_all.append(calculate_average_distances(rand_groups, gl_vecs))
+
+print("\n📈 חישוב סטטיסטיקה עם תיקון Bonferroni...")
+num_tests = len(prime_groups) * 3  # מספר ראשוניים × 3 מודלים
+print(f"מספר בדיקות: {num_tests}")
+print(f"סף Bonferroni: p < {0.05/num_tests:.6f}")
+
+w2v_stats = calculate_statistics_with_bonferroni(prime_w2v, rand_w2v_all, num_tests)
+ft_stats = calculate_statistics_with_bonferroni(prime_ft, rand_ft_all, num_tests)
+gl_stats = calculate_statistics_with_bonferroni(prime_gl, rand_gl_all, num_tests)
+
+# הדפסת סטטיסטיקה מפורטת
+print_detailed_statistics(w2v_stats, ft_stats, gl_stats, ["Word2Vec", "FastText", "GloVe"])
+
+print("\n📊 יצירת גרפים...")
+timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+# גרף Z-scores משופר
+create_enhanced_bar_chart(w2v_stats, ft_stats, gl_stats, f'improved_zscores_{timestamp}.png')
+
+# גרף Effect Size חדש
+create_effect_size_chart(w2v_stats, ft_stats, gl_stats, f'effect_size_{timestamp}.png')
+
+print("\n" + "="*80)
+print("✓ ניתוח הושלם בהצלחה!")
+print("="*80)
